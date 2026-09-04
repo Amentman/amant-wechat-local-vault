@@ -13,8 +13,10 @@ import platform
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -51,6 +53,34 @@ def write_private_json(path: Path, payload: object) -> None:
         handle.write("\n")
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+
+
+def load_captured_key(path: Path, key_fingerprint: str | None = None) -> str:
+    if path.is_symlink():
+        raise PermissionError("Refusing to read a symbolic-link key store")
+    metadata = path.stat()
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise PermissionError("Key store must be readable only by its owner (mode 0600)")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise PermissionError("Key store must be owned by the current user")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    candidates = payload.get("candidates") if isinstance(payload, dict) else None
+    if not isinstance(candidates, list):
+        raise ValueError("Key store must contain a candidates list")
+    keys = [
+        item["derived_key"]
+        for item in candidates
+        if isinstance(item, dict)
+        and isinstance(item.get("derived_key"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", item["derived_key"])
+    ]
+    if key_fingerprint is not None:
+        keys = [key for key in keys if fingerprint(key) == key_fingerprint]
+        if not keys:
+            raise ValueError("No captured key matches --key-fingerprint")
+    if len(keys) != 1:
+        raise ValueError("Key store has multiple valid candidates; select one with --key-fingerprint")
+    return keys[0]
 
 
 def build_frida_script() -> str:
@@ -220,13 +250,38 @@ def _page_keys(key_hex: str, salt: bytes, hmac_key_hex: str | None) -> tuple[byt
     return encryption_key, hmac_key
 
 
+def ensure_distinct_paths(source: Path, output: Path) -> None:
+    if source.resolve() == output.resolve():
+        raise ValueError("Source and output must not be the same file")
+    if output.exists() and os.path.samefile(source, output):
+        raise ValueError("Source and output must not be the same file")
+
+
+def private_temp_output(output: Path, overwrite: bool) -> tuple[int, Path]:
+    if output.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists; pass --overwrite to replace it: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    os.chmod(temporary, 0o600)
+    return fd, temporary
+
+
 def decrypt_sqlcipher_database(
     source: Path,
     output: Path,
     key_hex: str,
     hmac_key_hex: str | None = None,
     page_size: int = 4096,
+    overwrite: bool = False,
 ) -> dict:
+    ensure_distinct_paths(source, output)
+    if output.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists; pass --overwrite to replace it: {output}")
     try:
         from Crypto.Cipher import AES
     except ImportError as exc:
@@ -236,26 +291,30 @@ def decrypt_sqlcipher_database(
         raise ValueError("Encrypted database size is not a whole number of pages")
     salt = raw[:16]
     encryption_key, hmac_key = _page_keys(key_hex, salt, hmac_key_hex)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, temporary = private_temp_output(output, overwrite)
     pages = len(raw) // page_size
-    with os.fdopen(fd, "wb") as handle:
-        for page_number in range(1, pages + 1):
-            page = raw[(page_number - 1) * page_size:page_number * page_size]
-            offset = 16 if page_number == 1 else 0
-            cipher_text = page[offset:page_size - 80]
-            iv = page[page_size - 80:page_size - 64]
-            stored_hmac = page[page_size - 64:page_size]
-            page_bytes = page_number.to_bytes(4, "little")
-            calculated = hmac.new(hmac_key, cipher_text + iv + page_bytes, hashlib.sha512).digest()
-            if not hmac.compare_digest(stored_hmac, calculated):
-                raise ValueError(f"HMAC verification failed on page {page_number}; key or format is wrong")
-            plain = AES.new(encryption_key, AES.MODE_CBC, iv).decrypt(cipher_text)
-            if page_number == 1:
-                handle.write(b"SQLite format 3\x00")
-            handle.write(plain)
-            handle.write(b"\x00" * 80)
-    os.chmod(output, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            for page_number in range(1, pages + 1):
+                page = raw[(page_number - 1) * page_size:page_number * page_size]
+                offset = 16 if page_number == 1 else 0
+                cipher_text = page[offset:page_size - 80]
+                iv = page[page_size - 80:page_size - 64]
+                stored_hmac = page[page_size - 64:page_size]
+                page_bytes = page_number.to_bytes(4, "little")
+                calculated = hmac.new(hmac_key, cipher_text + iv + page_bytes, hashlib.sha512).digest()
+                if not hmac.compare_digest(stored_hmac, calculated):
+                    raise ValueError(f"HMAC verification failed on page {page_number}; key or format is wrong")
+                plain = AES.new(encryption_key, AES.MODE_CBC, iv).decrypt(cipher_text)
+                if page_number == 1:
+                    handle.write(b"SQLite format 3\x00")
+                handle.write(plain)
+                handle.write(b"\x00" * 80)
+        os.replace(temporary, output)
+        os.chmod(output, 0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return {"status": "ok", "pages": pages, "output": str(output), "key_fingerprint": fingerprint(key_hex)}
 
 
@@ -330,18 +389,22 @@ def database_digest(database: Path) -> dict:
         connection.close()
 
 
-def export_results(results: list[dict], output: Path, fmt: str) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-        if fmt == "jsonl":
-            for row in results:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        else:
-            writer = csv.DictWriter(handle, fieldnames=["table", "rowid", "column", "value"])
-            writer.writeheader()
-            writer.writerows(results)
-    os.chmod(output, 0o600)
+def export_results(results: list[dict], output: Path, fmt: str, overwrite: bool = False) -> None:
+    fd, temporary = private_temp_output(output, overwrite)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if fmt == "jsonl":
+                for row in results:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            else:
+                writer = csv.DictWriter(handle, fieldnames=["table", "rowid", "column", "value"])
+                writer.writeheader()
+                writer.writerows(results)
+        os.replace(temporary, output)
+        os.chmod(output, 0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def doctor() -> dict:
@@ -378,29 +441,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     decrypt.add_argument("--authorized", action="store_true")
     decrypt.add_argument("--source-db", required=True, type=Path)
     decrypt.add_argument("--output", required=True, type=Path)
-    decrypt.add_argument("--key-hex", required=True)
-    decrypt.add_argument("--hmac-key-hex")
+    decrypt.add_argument("--key-file", type=Path, default=KEY_STORE)
+    decrypt.add_argument("--key-fingerprint")
+    decrypt.add_argument("--overwrite", action="store_true")
 
     search = sub.add_parser("search")
+    search.add_argument("--authorized", action="store_true")
     search.add_argument("query")
     search.add_argument("--db", required=True, type=Path)
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--show-content", action="store_true")
 
     export = sub.add_parser("export")
+    export.add_argument("--authorized", action="store_true")
     export.add_argument("--db", required=True, type=Path)
     export.add_argument("--query", required=True)
     export.add_argument("--output", required=True, type=Path)
     export.add_argument("--format", choices=("jsonl", "csv"), default="jsonl")
     export.add_argument("--limit", type=int, default=1000)
+    export.add_argument("--overwrite", action="store_true")
 
     for name in ("contacts", "moments", "favorites"):
         command = sub.add_parser(name)
+        command.add_argument("--authorized", action="store_true")
         command.add_argument("--db", required=True, type=Path)
         command.add_argument("--limit", type=int, default=20)
         command.add_argument("--show-content", action="store_true")
 
     digest = sub.add_parser("digest")
+    digest.add_argument("--authorized", action="store_true")
     digest.add_argument("--db", required=True, type=Path)
     return parser.parse_args(argv)
 
@@ -412,13 +481,13 @@ def main() -> int:
             report = doctor()
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report["ok"] else 1
+        require_authorized(args.authorized)
         if args.command == "capture-keys":
-            require_authorized(args.authorized)
             capture_keys(dry_run=args.dry_run, launch_copy=args.launch_copy, duration=args.duration)
             return 0
         if args.command == "decrypt":
-            require_authorized(args.authorized)
-            report = decrypt_sqlcipher_database(args.source_db, args.output, args.key_hex, args.hmac_key_hex)
+            key_hex = load_captured_key(args.key_file, args.key_fingerprint)
+            report = decrypt_sqlcipher_database(args.source_db, args.output, key_hex, overwrite=args.overwrite)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0
         if args.command == "digest":
@@ -434,7 +503,8 @@ def main() -> int:
         else:
             results = search_database(args.db, args.query, args.limit)
         if args.command == "export":
-            export_results(results, args.output, args.format)
+            ensure_distinct_paths(args.db, args.output)
+            export_results(results, args.output, args.format, overwrite=args.overwrite)
             print(json.dumps({"status": "ok", "rows": len(results), "output": str(args.output)}, ensure_ascii=False))
             return 0
         if args.show_content:
@@ -447,7 +517,7 @@ def main() -> int:
             output = [{**row, "value": f"<redacted:{fingerprint(str(row['value']))}>"} for row in results]
         print(json.dumps({"status": "ok", "matches": output}, ensure_ascii=False, indent=2))
         return 0
-    except (AuthorizationError, FileNotFoundError, RuntimeError, ValueError, sqlite3.Error) as exc:
+    except (AuthorizationError, OSError, RuntimeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

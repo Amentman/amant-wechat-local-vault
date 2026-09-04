@@ -5,7 +5,7 @@ description: Use when a macOS user wants to inspect, decrypt, search, export, or
 
 # 寂辉微信本地资料库
 
-当前公开版本：v0.3.0。
+当前公开版本：v0.3.1。
 
 只处理当前用户本人或已获明确授权的本机微信数据。默认本地运行，不上传、不发消息、不操作微信聊天界面。
 
@@ -24,6 +24,8 @@ description: Use when a macOS user wants to inspect, decrypt, search, export, or
 
 ## 强制安全门
 
+下面所有相对命令都以包含此 `SKILL.md` 的目录为基准，不以用户当前工作目录为基准。
+
 1. 先运行 `python3 scripts/bootstrap.py --check`。返回 `missing` 或 `incomplete`
    时运行 `python3 scripts/bootstrap.py --install`，然后使用返回的
    `runtime_python` 执行 `wechat_vault.py`，不要调用未安装依赖的系统 Python。
@@ -37,13 +39,14 @@ description: Use when a macOS user wants to inspect, decrypt, search, export, or
 1. `doctor` 检查 macOS、微信、codesign、Python、Frida、PyCryptodome 和 Zstandard。
 2. 先用 `capture-keys --authorized --dry-run` 展示计划。
 3. 已运行的微信可直接 attach；需要启动工具副本时使用 `--launch-copy`。捕获结果写入仅当前用户可读的私有文件，终端只显示指纹。
-4. 用 `decrypt --authorized --source-db ... --output ... --key-hex ...` 在派生副本上解密。源数据库保持只读。
-5. 使用 `search`、`contacts`、`moments`、`favorites`、`export` 和 `digest` 处理解密后的 SQLite 文件。微信版本与表结构不一致时，先用 `digest` 查看实际表，再选择关键词。
+4. 用 `decrypt --authorized --source-db ... --output ... --key-fingerprint ...` 从 owner-only `keys.json` 选择候选，在临时文件中验证全部页面后原子写成明文副本。拒绝源/输出同文件，默认拒绝覆盖现有输出；完整 key 不进入命令行。
+5. 使用带 `--authorized` 的 `search`、`contacts`、`moments`、`favorites`、`export` 和 `digest` 处理解密后的 SQLite 文件。微信版本与表结构不一致时，先用 `digest` 查看实际表，再选择关键词。
 
 ## 重要限制
 
 - 微信更新可能改变 KDF 调用或数据库格式；HMAC 校验失败就停止，不猜 key、不输出伪成功。
 - 自动捕获会监听本机进程中的密钥派生函数。只有在微信执行相应派生操作时才会出现候选密钥。
+- 解密和导出默认不覆盖已有文件；只有用户明确要求替换时使用 `--overwrite`。任一步失败都不得留下部分输出或损坏旧文件。
 - `contacts`、`moments` 和 `favorites` 使用数据库无关的文本检索；它们不会声称理解未知私有表结构。
 - 不提供消息发送、账号接管、绕过远程认证、云同步或他人设备采集能力。
 

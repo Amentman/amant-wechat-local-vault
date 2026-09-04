@@ -15,6 +15,7 @@
 - 先 dry-run 展示捕获计划，再由用户选择附加到当前微信，或另行允许启动工具副本。
 - 完整密钥只写入当前用户可读的本地文件，终端默认只显示 12 位指纹。
 - 解密只读取用户指定的源数据库，并写入另一个权限为 `0600` 的输出文件。
+- 解密和导出先写同目录临时文件，完整成功后再原子替换；默认拒绝覆盖现有文件，也拒绝源文件与输出指向同一个文件或 inode。
 - 每页 HMAC 验证通过才继续；拿错密钥或格式变化时明确失败，不伪造成功。
 - 搜索和浏览默认脱敏；只有用户明确要求看正文时才使用 `--show-content`。
 
@@ -69,23 +70,21 @@ flowchart TD
 
 ```bash
 npx skills add Amentman/amant-wechat-local-vault@amant-wechat-local-vault -g -y
+cd ~/.agents/skills/amant-wechat-local-vault
+python3 scripts/bootstrap.py --install
+.venv/bin/python scripts/wechat_vault.py doctor
 ```
 
 只安装到当前项目：
 
 ```bash
 npx skills add Amentman/amant-wechat-local-vault@amant-wechat-local-vault --agent codex --yes --copy
-```
-
-安装锁定的 Python 运行环境：
-
-```bash
-cd ~/.agents/skills/amant-wechat-local-vault
+cd .agents/skills/amant-wechat-local-vault
 python3 scripts/bootstrap.py --install
 .venv/bin/python scripts/wechat_vault.py doctor
 ```
 
-`bootstrap.py` 安装并验证固定版本的 Frida、PyCryptodome 和 Zstandard；后续命令使用它返回的 `runtime_python`，不要绕回缺少依赖的系统 Python。
+两个分支都要先进入自己的实际安装目录，再运行 bootstrap 和 doctor。`bootstrap.py` 安装并验证固定版本的 Frida、PyCryptodome 和 Zstandard；后续命令使用它返回的 `runtime_python`，不要绕回缺少依赖的系统 Python。
 
 ## 第一次使用
 
@@ -122,7 +121,7 @@ python3 scripts/bootstrap.py --install
 | 3. 授权门 | 数据归属和本次允许的动作 | 没有明确授权就停止；私有命令要求 `--authorized` | 授权范围说明 |
 | 4. 捕获预演 | attach 或工具副本；持续时间 | 输出将使用的 App、模式、保存位置和时长，不附加进程 | dry-run 计划 JSON |
 | 5. 捕获候选 | 用户明确允许真实捕获 | 监听本机 PBKDF 派生结果，去重候选；终端只打印指纹 | 私有 `keys.json`、candidate count |
-| 6. 选择数据库 | 加密 DB 绝对路径和新输出路径 | 只读源文件，使用候选 key 逐页验证并解密 | 权限为 `0600` 的明文副本 |
+| 6. 选择数据库 | 加密 DB 绝对路径、新输出路径和候选指纹 | 从 owner-only key store 读取候选，逐页验证并原子写入新副本 | 权限为 `0600` 的明文副本 |
 | 7. 查看结构 | 明文 DB 路径 | 只读打开 SQLite，列出真实表名和行数 | digest JSON |
 | 8. 搜索或浏览 | 关键词、功能、条数 | 搜索文本列，或按公开功能提示找候选表 | 默认脱敏的匹配结果 |
 | 9. 导出 | 查询、格式和输出路径 | 写出 JSONL 或 CSV，文件权限设为 `0600` | 本地导出文件和行数 |
@@ -136,7 +135,8 @@ python3 scripts/bootstrap.py --install
 - 捕获模式：attach 或 `--launch-copy`，以及捕获时长。
 - `source-db`：用户明确指定的加密数据库绝对路径。
 - `output`：与源文件不同的明文数据库或导出文件路径。
-- `key-hex`：本机私有 key store 中的 32 字节派生密钥候选。
+- `key-file`：本机 owner-only `keys.json`；默认使用捕获命令返回的私有路径。
+- `key-fingerprint`：终端显示的 12 位候选指纹。key store 只有一个有效候选时可省略；有多个时必须选择。
 - 搜索关键词、结果上限，以及是否明确允许显示正文。
 
 默认本地资产目录：
@@ -152,7 +152,7 @@ python3 scripts/bootstrap.py --install
 
 ## 完整示例
 
-以下路径和 key 都是占位符，必须替换成本机本次授权的数据：
+以下路径是占位符，必须替换成本机本次授权的数据。完整密钥不会进入命令行：
 
 ```bash
 # 1. 安装并检查
@@ -165,21 +165,22 @@ python3 scripts/bootstrap.py --install
 # 3. 用户确认后，附加当前微信并捕获候选；终端不显示完整 key
 .venv/bin/python scripts/wechat_vault.py capture-keys --authorized --duration 30
 
-# 4. 从本机私有 keys.json 选择候选，解密到另一个文件
+# 4. 按终端显示的指纹从私有 keys.json 选择候选，解密到另一个文件
 .venv/bin/python scripts/wechat_vault.py decrypt --authorized \
   --source-db "/absolute/path/to/encrypted.db" \
   --output "/absolute/path/to/plain.db" \
-  --key-hex "REPLACE_WITH_64_HEX_KEY"
+  --key-fingerprint "REPLACE_WITH_12_CHAR_FINGERPRINT"
 
 # 5. 先看实际数据库结构
-.venv/bin/python scripts/wechat_vault.py digest --db "/absolute/path/to/plain.db"
+.venv/bin/python scripts/wechat_vault.py digest --authorized \
+  --db "/absolute/path/to/plain.db"
 
 # 6. 默认脱敏搜索
-.venv/bin/python scripts/wechat_vault.py search "产品反馈" \
+.venv/bin/python scripts/wechat_vault.py search "产品反馈" --authorized \
   --db "/absolute/path/to/plain.db" --limit 20
 
 # 7. 将明确查询导出到本地 owner-only 文件
-.venv/bin/python scripts/wechat_vault.py export \
+.venv/bin/python scripts/wechat_vault.py export --authorized \
   --db "/absolute/path/to/plain.db" \
   --query "产品反馈" --format jsonl --output ./exports/result.jsonl
 ```
@@ -189,9 +190,9 @@ python3 scripts/bootstrap.py --install
 `contacts`、`moments` 和 `favorites` 命令会根据表名公开提示寻找候选表：
 
 ```bash
-.venv/bin/python scripts/wechat_vault.py contacts --db "/absolute/path/to/plain.db" --limit 20
-.venv/bin/python scripts/wechat_vault.py moments --db "/absolute/path/to/plain.db" --limit 20
-.venv/bin/python scripts/wechat_vault.py favorites --db "/absolute/path/to/plain.db" --limit 20
+.venv/bin/python scripts/wechat_vault.py contacts --authorized --db "/absolute/path/to/plain.db" --limit 20
+.venv/bin/python scripts/wechat_vault.py moments --authorized --db "/absolute/path/to/plain.db" --limit 20
+.venv/bin/python scripts/wechat_vault.py favorites --authorized --db "/absolute/path/to/plain.db" --limit 20
 ```
 
 它们默认返回字段指纹，不把未知私有表结构冒充成已经正确解析的产品语义。
@@ -204,6 +205,8 @@ python3 scripts/bootstrap.py --install
 - attach 找不到微信进程：报告失败；不能自行改为 `--launch-copy`。
 - `candidate_count: 0`：只说明本次没有捕获到候选，不等于没有数据库或工具已完成。
 - HMAC 任一页失败：停止，说明 key 或数据库格式不匹配，不把部分输出当作有效数据库。
+- 源和输出是同一路径、符号链接或硬链接：拒绝执行。输出已存在时默认停止；只有用户明确要求替换才使用 `--overwrite`，且失败时保留旧文件。
+- 完整密钥只从权限为 `0600`、属于当前用户且不是符号链接的 `keys.json` 读取；命令行只传候选指纹。
 - 数据库表结构与已知提示不同：先输出 digest，再做保守搜索，不编造联系人、朋友圈或收藏语义。
 - 默认不显示正文；只有用户明确要求查看具体内容时才使用 `--show-content`。
 - 工具不发送微信消息、不操作聊天界面、不上传远端、不修改原始 WeChat.app，也不采集他人设备。
@@ -215,7 +218,7 @@ python3 scripts/bootstrap.py --install
 
 - 运行环境：bootstrap 返回 `ready`，doctor 的每项检查结果明确。
 - 密钥捕获：用户确认了真实模式；输出有真实 `candidate_count` 和本机 key store 路径，完整秘密未出现在终端。
-- 数据库解密：目标 key 对全部页面的 HMAC 检查通过；输出是另一个实际存在的 `0600` 文件；源数据库未被修改。
+- 数据库解密：目标 key 对全部页面的 HMAC 检查通过；输出经临时文件原子写成另一个实际存在的 `0600` 文件；源数据库未被修改，失败时没有残留部分明文。
 - 检索：先确认 SQLite 能以只读模式打开，digest 给出真实表数和行数；搜索报告真实匹配数。
 - 导出：目标 JSONL/CSV 实际存在、权限为 `0600`，报告的行数与文件内容一致。
 - 最终报告区分“环境就绪、捕获到候选、解密成功、搜索成功”四种状态，不用其中一步替代整条链路。

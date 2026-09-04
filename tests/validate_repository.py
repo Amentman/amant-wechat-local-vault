@@ -36,11 +36,17 @@ def assert_workflow_docs_complete(readme: str, skill_text: str) -> None:
     assert "| 步骤 | 用户提供或决定 | Skill 会做什么 | 可验证产物 |" in readme
     assert "## 总体运行流程" in skill_text, "SKILL.md missing agent execution overview"
     assert "输入 → 处理 → 输出" in skill_text
+    assert "cd ~/.agents/skills/amant-wechat-local-vault" in readme
+    assert "cd .agents/skills/amant-wechat-local-vault" in readme
+    assert "--key-hex" not in readme
+    assert "--key-hex" not in skill_text
+    assert "--key-fingerprint" in readme
+    assert "原子" in readme
 
 
 def main() -> None:
     manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-    assert manifest["version"] == "0.3.0"
+    assert manifest["version"] == "0.3.1"
     assert manifest["author"]["name"] == "Amant"
     assert manifest["skills"] == "./skills/"
 
