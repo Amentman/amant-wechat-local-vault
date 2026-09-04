@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -55,37 +56,73 @@ def write_private_json(path: Path, payload: object) -> None:
 def build_frida_script() -> str:
     return r"""
 'use strict';
-const name = 'CCKeyDerivationPBKDF';
-const target = Module.findGlobalExportByName
-  ? Module.findGlobalExportByName(name)
-  : Module.findExportByName(null, name);
-if (!target) throw new Error(name + ' export not found');
-function toHex(buffer) {
-  return Array.from(new Uint8Array(buffer)).map(x => x.toString(16).padStart(2, '0')).join('');
+const CHANNEL = 'amant-wechat-vault';
+const SYMBOL = 'CCKeyDerivationPBKDF';
+const address = Module.findGlobalExportByName(SYMBOL);
+if (address === null) throw new Error(`${SYMBOL} export not found`);
+
+function encodePointer(pointer, length, maximum) {
+  if (pointer.isNull() || length <= 0 || length > maximum) return null;
+  const view = new Uint8Array(pointer.readByteArray(length));
+  let result = '';
+  for (const value of view) result += value.toString(16).padStart(2, '0');
+  return result;
 }
-Interceptor.attach(target, {
+
+const activeCalls = new Map();
+Interceptor.attach(address, {
   onEnter(args) {
-    this.salt = args[3];
-    this.saltLength = args[4].toInt32();
-    this.rounds = args[6].toInt32();
-    this.derivedKey = args[7];
-    this.derivedKeyLength = args[8].toInt32();
+    const callId = `${this.threadId}:${this.depth}`;
+    this.amantCallId = callId;
+    activeCalls.set(callId, {
+      saltPointer: args[3],
+      saltLength: args[4].toInt32(),
+      rounds: args[6].toInt32(),
+      outputPointer: args[7],
+      outputLength: args[8].toInt32()
+    });
   },
-  onLeave(retval) {
-    if (retval.toInt32() !== 0 || this.derivedKeyLength < 16 || this.derivedKeyLength > 64) return;
-    const saltBytes = this.saltLength > 0 && this.saltLength <= 64
-      ? Memory.readByteArray(this.salt, this.saltLength) : new ArrayBuffer(0);
-    const keyBytes = Memory.readByteArray(this.derivedKey, this.derivedKeyLength);
+  onLeave(status) {
+    const call = activeCalls.get(this.amantCallId);
+    activeCalls.delete(this.amantCallId);
+    if (!call || status.toInt32() !== 0) return;
+    const keyHex = encodePointer(call.outputPointer, call.outputLength, 128);
+    const saltHex = encodePointer(call.saltPointer, call.saltLength, 64);
+    if (keyHex === null || saltHex === null) return;
     send({
-      event: 'derived_key',
-      salt: toHex(saltBytes),
-      derived_key: toHex(keyBytes),
-      rounds: this.rounds
+      channel: CHANNEL,
+      kind: 'pbkdf-result',
+      material: { keyHex, saltHex, rounds: call.rounds }
     });
   }
 });
-send({event: 'hook_ready', symbol: name});
+send({channel: CHANNEL, kind: 'ready', symbol: SYMBOL});
 """.strip()
+
+
+def parse_capture_message(message: dict) -> dict | None:
+    if message.get("type") != "send":
+        return None
+    payload = message.get("payload")
+    if not isinstance(payload, dict) or payload.get("channel") != "amant-wechat-vault":
+        return None
+    if payload.get("kind") != "pbkdf-result":
+        return None
+    material = payload.get("material")
+    if not isinstance(material, dict):
+        return None
+    key_hex = material.get("keyHex")
+    salt_hex = material.get("saltHex")
+    rounds = material.get("rounds")
+    if not isinstance(key_hex, str) or not isinstance(salt_hex, str) or not isinstance(rounds, int):
+        return None
+    if not re.fullmatch(r"[0-9a-f]+", key_hex) or not re.fullmatch(r"[0-9a-f]+", salt_hex):
+        return None
+    if len(key_hex) % 2 or not 16 <= len(key_hex) // 2 <= 128:
+        return None
+    if len(salt_hex) % 2 or not 1 <= len(salt_hex) // 2 <= 64:
+        return None
+    return {"derived_key": key_hex, "salt": salt_hex, "rounds": rounds}
 
 
 def prepare_app_copy(refresh: bool = False) -> Path:
@@ -134,26 +171,24 @@ def capture_keys(*, dry_run: bool, launch_copy: bool, duration: int) -> list[dic
     seen: set[tuple[str, str]] = set()
 
     def on_message(message, _data):
-        if message.get("type") != "send":
+        candidate = parse_capture_message(message)
+        if candidate is None:
             return
-        payload = message.get("payload", {})
-        if payload.get("event") != "derived_key":
-            return
-        pair = (payload.get("derived_key", ""), payload.get("salt", ""))
+        pair = (candidate["derived_key"], candidate["salt"])
         if not pair[0] or pair in seen:
             return
         seen.add(pair)
         captured.append({
             "derived_key": pair[0],
             "salt": pair[1],
-            "rounds": payload.get("rounds"),
+            "rounds": candidate["rounds"],
             "captured_at": int(time.time()),
         })
         print(json.dumps({
             "event": "key-candidate",
             "key_fingerprint": fingerprint(pair[0]),
             "salt_fingerprint": fingerprint(pair[1]),
-            "rounds": payload.get("rounds"),
+            "rounds": candidate["rounds"],
         }, ensure_ascii=False))
 
     script = session.create_script(build_frida_script())
@@ -328,7 +363,7 @@ def doctor() -> dict:
     return {"ok": all(checks.values()), "checks": checks, "app_root": str(APP_ROOT)}
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
@@ -367,7 +402,7 @@ def parse_args() -> argparse.Namespace:
 
     digest = sub.add_parser("digest")
     digest.add_argument("--db", required=True, type=Path)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:

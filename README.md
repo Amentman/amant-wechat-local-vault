@@ -14,9 +14,7 @@ npx skills add Amentman/amant-wechat-local-vault@amant-wechat-local-vault -g -y
 
 ```bash
 cd ~/.agents/skills/amant-wechat-local-vault
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python scripts/wechat_vault.py doctor
+python3 scripts/bootstrap.py --install
 ```
 
 ## 安全使用
@@ -28,9 +26,10 @@ python3 -m venv .venv
 # 真实捕获必须显式声明授权；输出只显示密钥指纹
 .venv/bin/python scripts/wechat_vault.py capture-keys --authorized
 
-.venv/bin/python scripts/wechat_vault.py decrypt --authorized
-.venv/bin/python scripts/wechat_vault.py search "产品反馈" --limit 20
-.venv/bin/python scripts/wechat_vault.py export --format jsonl --output ./exports/result.jsonl
+# 将下面路径和 64 位十六进制密钥替换成你的真实授权数据
+.venv/bin/python scripts/wechat_vault.py decrypt --authorized --source-db "/absolute/path/to/encrypted.db" --output "/absolute/path/to/plain.db" --key-hex "REPLACE_WITH_64_HEX_KEY"
+.venv/bin/python scripts/wechat_vault.py search "产品反馈" --db "/absolute/path/to/plain.db" --limit 20
+.venv/bin/python scripts/wechat_vault.py export --db "/absolute/path/to/plain.db" --query "产品反馈" --format jsonl --output ./exports/result.jsonl
 ```
 
-工具不发送消息、不操作微信界面、不上传远端，也不会修改 `/Applications/WeChat.app` 原件。实现为 Amant 独立编写，未复制 `mcncarl/yichen-skills` 或无明确许可证项目的代码。许可证：MIT。
+工具不发送消息、不操作微信界面、不上传远端，也不会修改 `/Applications/WeChat.app` 原件。公开实现依据见 [implementation-sources.md](skills/amant-wechat-local-vault/references/implementation-sources.md)。许可证：MIT。

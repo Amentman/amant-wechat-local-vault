@@ -9,6 +9,8 @@ from scripts.wechat_vault import (
     browse_tables,
     build_frida_script,
     fingerprint,
+    parse_args,
+    parse_capture_message,
     require_authorized,
     search_database,
     write_private_json,
@@ -29,9 +31,44 @@ class WeChatVaultTests(unittest.TestCase):
     def test_frida_script_emits_key_and_salt_candidates(self):
         script = build_frida_script()
         self.assertIn("CCKeyDerivationPBKDF", script)
-        self.assertIn("derived_key", script)
-        self.assertIn("salt", script)
+        self.assertIn("pbkdf-result", script)
+        self.assertIn("keyHex", script)
         self.assertIn("Interceptor.attach", script)
+
+    def test_capture_message_accepts_only_the_namespaced_event_contract(self):
+        message = {
+            "type": "send",
+            "payload": {
+                "channel": "amant-wechat-vault",
+                "kind": "pbkdf-result",
+                "material": {
+                    "keyHex": "ab" * 32,
+                    "saltHex": "cd" * 16,
+                    "rounds": 256000,
+                },
+            },
+        }
+        self.assertEqual(parse_capture_message(message), {
+            "derived_key": "ab" * 32,
+            "salt": "cd" * 16,
+            "rounds": 256000,
+        })
+        self.assertIsNone(parse_capture_message({"type": "error", "payload": message["payload"]}))
+        self.assertIsNone(parse_capture_message({"type": "send", "payload": {"kind": "pbkdf-result"}}))
+
+    def test_readme_command_shapes_parse_with_all_required_arguments(self):
+        decrypt = parse_args([
+            "decrypt", "--authorized", "--source-db", "/tmp/source.db",
+            "--output", "/tmp/plain.db", "--key-hex", "ab" * 32,
+        ])
+        self.assertEqual(decrypt.command, "decrypt")
+        search = parse_args(["search", "产品反馈", "--db", "/tmp/plain.db", "--limit", "20"])
+        self.assertEqual(search.command, "search")
+        export = parse_args([
+            "export", "--db", "/tmp/plain.db", "--query", "产品反馈",
+            "--format", "jsonl", "--output", "/tmp/result.jsonl",
+        ])
+        self.assertEqual(export.command, "export")
 
     def test_private_json_uses_owner_only_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:

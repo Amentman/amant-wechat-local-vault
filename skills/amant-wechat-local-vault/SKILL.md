@@ -9,7 +9,9 @@ description: Use when a macOS user wants to inspect, decrypt, search, export, or
 
 ## 强制安全门
 
-1. 先运行 `python3 scripts/wechat_vault.py doctor`。
+1. 先运行 `python3 scripts/bootstrap.py --check`。返回 `missing` 或 `incomplete`
+   时运行 `python3 scripts/bootstrap.py --install`，然后使用返回的
+   `runtime_python` 执行 `wechat_vault.py`，不要调用未安装依赖的系统 Python。
 2. 在复制 App、重签名、启动 Frida、读取数据库或写出明文前，说明动作与目标，并取得当前用户明确确认。
 3. 任何私有数据命令必须带 `--authorized`；不得替用户推定授权。
 4. 永不修改 `/Applications/WeChat.app`。需要重新启动时只操作工具目录内的副本。
@@ -29,3 +31,6 @@ description: Use when a macOS user wants to inspect, decrypt, search, export, or
 - 自动捕获会监听本机进程中的密钥派生函数。只有在微信执行相应派生操作时才会出现候选密钥。
 - `contacts`、`moments` 和 `favorites` 使用数据库无关的文本检索；它们不会声称理解未知私有表结构。
 - 不提供消息发送、账号接管、绕过远程认证、云同步或他人设备采集能力。
+
+公开实现依据和许可证边界见 [implementation-sources.md](references/implementation-sources.md)。
+普通使用不需要加载这份维护说明。
