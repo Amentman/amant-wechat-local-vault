@@ -27,6 +27,13 @@ def main() -> None:
     assert f"Amentman/{manifest['name']}" in readme
     assert "npx skills add" in readme
 
+    workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text()
+    assert "Install and verify the real isolated runtime" in workflow
+    assert "bootstrap.py --install" in workflow
+
+    sources = (skill_dirs[0] / "references" / "implementation-sources.md").read_text()
+    assert "apple-oss-distributions/CommonCrypto" in sources
+
     forbidden = [
         "/" + "Users/" + "amant/",
         "space" + "_id:",

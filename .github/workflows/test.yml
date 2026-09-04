@@ -20,9 +20,11 @@ jobs:
       - name: Test local vault with synthetic data
         working-directory: skills/amant-wechat-local-vault
         run: python3 -m unittest discover -s tests -v
-      - name: Verify one-command bootstrap plan
+      - name: Install and verify the real isolated runtime
         working-directory: skills/amant-wechat-local-vault
-        run: python3 scripts/bootstrap.py --dry-run
-      - name: Verify capture dry-run
-        working-directory: skills/amant-wechat-local-vault
-        run: python3 scripts/wechat_vault.py capture-keys --authorized --dry-run
+        run: |
+          python3 scripts/bootstrap.py --install
+          runtime_python="$(python3 scripts/bootstrap.py --check | python3 -c 'import json, sys; print(json.load(sys.stdin)["runtime_python"])')"
+          "$runtime_python" -c 'import frida, Crypto, zstandard'
+          "$runtime_python" -m unittest discover -s tests -v
+          "$runtime_python" scripts/wechat_vault.py capture-keys --authorized --dry-run

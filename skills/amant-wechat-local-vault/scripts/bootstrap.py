@@ -12,6 +12,17 @@ from pathlib import Path
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_PROBE = """\
+import json
+checks = {}
+for module, key in (("frida", "frida"), ("Crypto", "pycryptodome"), ("zstandard", "zstandard")):
+    try:
+        __import__(module)
+        checks[key] = True
+    except ImportError:
+        checks[key] = False
+print(json.dumps({"ok": all(checks.values()), "checks": checks}))
+"""
 
 
 def build_bootstrap_plan(
@@ -41,7 +52,7 @@ def check_runtime(*, skill_root: Path = SKILL_ROOT) -> dict:
     if not runtime_python.is_file():
         return {"status": "missing", "runtime_python": str(runtime_python), "doctor": None}
     result = subprocess.run(
-        [str(runtime_python), str(skill_root / "scripts" / "wechat_vault.py"), "doctor"],
+        [str(runtime_python), "-c", RUNTIME_PROBE],
         check=False,
         capture_output=True,
         text=True,
@@ -53,7 +64,7 @@ def check_runtime(*, skill_root: Path = SKILL_ROOT) -> dict:
     return {
         "status": "ready" if result.returncode == 0 and report.get("ok") else "incomplete",
         "runtime_python": str(runtime_python),
-        "doctor": report,
+        "runtime": report,
     }
 
 
@@ -65,8 +76,8 @@ def install_runtime(*, skill_root: Path = SKILL_ROOT) -> dict:
         subprocess.run(step, check=True)
     report = check_runtime(skill_root=skill_root)
     if report["status"] != "ready":
-        missing = [name for name, ok in (report.get("doctor") or {}).get("checks", {}).items() if not ok]
-        raise RuntimeError(f"Runtime installation finished but doctor is incomplete: {', '.join(missing) or 'unknown'}")
+        missing = [name for name, ok in (report.get("runtime") or {}).get("checks", {}).items() if not ok]
+        raise RuntimeError(f"Runtime installation finished but dependencies are incomplete: {', '.join(missing) or 'unknown'}")
     return report
 
 

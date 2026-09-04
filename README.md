@@ -15,7 +15,10 @@ npx skills add Amentman/amant-wechat-local-vault@amant-wechat-local-vault -g -y
 ```bash
 cd ~/.agents/skills/amant-wechat-local-vault
 python3 scripts/bootstrap.py --install
+.venv/bin/python scripts/wechat_vault.py doctor
 ```
+
+`bootstrap.py` 只验证锁定的 Python 运行依赖；`doctor` 再检查 macOS、本机微信和 `codesign` 等设备条件。
 
 ## 安全使用
 
