@@ -8,9 +8,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def assert_relative_markdown_links_exist(markdown_path: Path) -> None:
+    text = markdown_path.read_text()
+    for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+        target = target.strip("<>").split("#", 1)[0]
+        if not target or "://" in target or target.startswith("#"):
+            continue
+        assert (markdown_path.parent / target).exists(), f"broken link: {markdown_path}:{target}"
+
+
+def assert_workflow_docs_complete(readme: str, skill_text: str) -> None:
+    required_readme_sections = [
+        "## 这个 Skill 解决什么问题",
+        "## 整体运行流程",
+        "## 开始前准备",
+        "## 安装",
+        "## 第一次使用",
+        "## 每一步会发生什么",
+        "## 输入与输出",
+        "## 完整示例",
+        "## 失败、停止与授权边界",
+        "## 如何确认真的完成",
+    ]
+    for section in required_readme_sections:
+        assert section in readme, f"README missing workflow section: {section}"
+    assert "```mermaid" in readme, "README missing rendered workflow diagram"
+    assert "| 步骤 | 用户提供或决定 | Skill 会做什么 | 可验证产物 |" in readme
+    assert "## 总体运行流程" in skill_text, "SKILL.md missing agent execution overview"
+    assert "输入 → 处理 → 输出" in skill_text
+
+
 def main() -> None:
     manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.3.0"
     assert manifest["author"]["name"] == "Amant"
     assert manifest["skills"] == "./skills/"
 
@@ -26,6 +56,9 @@ def main() -> None:
     readme = (ROOT / "README.md").read_text()
     assert f"Amentman/{manifest['name']}" in readme
     assert "npx skills add" in readme
+    assert_workflow_docs_complete(readme, skill_text)
+    for markdown_path in [ROOT / "README.md", skill_dirs[0] / "SKILL.md"]:
+        assert_relative_markdown_links_exist(markdown_path)
 
     workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text()
     assert "Install and verify the real isolated runtime" in workflow
