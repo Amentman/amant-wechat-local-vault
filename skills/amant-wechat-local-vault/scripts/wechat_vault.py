@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""Local-only tools for authorized macOS WeChat database inspection."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import hmac
+import json
+import os
+import platform
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+APP_ROOT = Path.home() / "Library" / "Application Support" / "AmantWeChatVault"
+KEY_STORE = APP_ROOT / "private" / "keys.json"
+DEFAULT_VAULT = APP_ROOT / "vault"
+ORIGINAL_APP = Path("/Applications/WeChat.app")
+APP_COPY = APP_ROOT / "apps" / "WeChatVault.app"
+
+
+class AuthorizationError(RuntimeError):
+    pass
+
+
+def require_authorized(authorized: bool) -> None:
+    if not authorized:
+        raise AuthorizationError(
+            "Refusing to access private WeChat data. Re-run with --authorized only for your own or explicitly authorized account."
+        )
+
+
+def fingerprint(value: str | bytes) -> str:
+    raw = value if isinstance(value, bytes) else value.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def write_private_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def build_frida_script() -> str:
+    return r"""
+'use strict';
+const name = 'CCKeyDerivationPBKDF';
+const target = Module.findGlobalExportByName
+  ? Module.findGlobalExportByName(name)
+  : Module.findExportByName(null, name);
+if (!target) throw new Error(name + ' export not found');
+function toHex(buffer) {
+  return Array.from(new Uint8Array(buffer)).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+Interceptor.attach(target, {
+  onEnter(args) {
+    this.salt = args[3];
+    this.saltLength = args[4].toInt32();
+    this.rounds = args[6].toInt32();
+    this.derivedKey = args[7];
+    this.derivedKeyLength = args[8].toInt32();
+  },
+  onLeave(retval) {
+    if (retval.toInt32() !== 0 || this.derivedKeyLength < 16 || this.derivedKeyLength > 64) return;
+    const saltBytes = this.saltLength > 0 && this.saltLength <= 64
+      ? Memory.readByteArray(this.salt, this.saltLength) : new ArrayBuffer(0);
+    const keyBytes = Memory.readByteArray(this.derivedKey, this.derivedKeyLength);
+    send({
+      event: 'derived_key',
+      salt: toHex(saltBytes),
+      derived_key: toHex(keyBytes),
+      rounds: this.rounds
+    });
+  }
+});
+send({event: 'hook_ready', symbol: name});
+""".strip()
+
+
+def prepare_app_copy(refresh: bool = False) -> Path:
+    if not ORIGINAL_APP.is_dir():
+        raise FileNotFoundError("WeChat.app was not found in /Applications.")
+    if APP_COPY.exists() and refresh:
+        shutil.rmtree(APP_COPY)
+    if not APP_COPY.exists():
+        APP_COPY.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(ORIGINAL_APP, APP_COPY, symlinks=True)
+        subprocess.run(
+            ["codesign", "--force", "--deep", "--sign", "-", str(APP_COPY)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    return APP_COPY / "Contents" / "MacOS" / "WeChat"
+
+
+def capture_keys(*, dry_run: bool, launch_copy: bool, duration: int) -> list[dict]:
+    plan = {
+        "mode": "launch-copy" if launch_copy else "attach",
+        "source_app": str(ORIGINAL_APP),
+        "app_copy": str(APP_COPY),
+        "key_store": str(KEY_STORE),
+        "duration_seconds": duration,
+    }
+    if dry_run:
+        print(json.dumps({"status": "dry-run", "plan": plan}, ensure_ascii=False, indent=2))
+        return []
+    try:
+        import frida
+    except ImportError as exc:
+        raise RuntimeError("Frida is missing. Install requirements.txt in the skill virtual environment.") from exc
+
+    device = frida.get_local_device()
+    pid = None
+    if launch_copy:
+        executable = prepare_app_copy()
+        pid = device.spawn([str(executable)])
+        session = device.attach(pid)
+    else:
+        session = device.attach("WeChat")
+
+    captured: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def on_message(message, _data):
+        if message.get("type") != "send":
+            return
+        payload = message.get("payload", {})
+        if payload.get("event") != "derived_key":
+            return
+        pair = (payload.get("derived_key", ""), payload.get("salt", ""))
+        if not pair[0] or pair in seen:
+            return
+        seen.add(pair)
+        captured.append({
+            "derived_key": pair[0],
+            "salt": pair[1],
+            "rounds": payload.get("rounds"),
+            "captured_at": int(time.time()),
+        })
+        print(json.dumps({
+            "event": "key-candidate",
+            "key_fingerprint": fingerprint(pair[0]),
+            "salt_fingerprint": fingerprint(pair[1]),
+            "rounds": payload.get("rounds"),
+        }, ensure_ascii=False))
+
+    script = session.create_script(build_frida_script())
+    script.on("message", on_message)
+    script.load()
+    if pid is not None:
+        device.resume(pid)
+    try:
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+    finally:
+        script.unload()
+        session.detach()
+    write_private_json(KEY_STORE, {"candidates": captured})
+    print(json.dumps({"status": "ok", "candidate_count": len(captured), "key_store": str(KEY_STORE)}, ensure_ascii=False))
+    return captured
+
+
+def _page_keys(key_hex: str, salt: bytes, hmac_key_hex: str | None) -> tuple[bytes, bytes]:
+    encryption_key = bytes.fromhex(key_hex)
+    if len(encryption_key) != 32:
+        raise ValueError("--key-hex must contain a 32-byte derived key")
+    if hmac_key_hex:
+        hmac_key = bytes.fromhex(hmac_key_hex)
+    else:
+        hmac_salt = bytes(byte ^ 0x3A for byte in salt)
+        hmac_key = hashlib.pbkdf2_hmac("sha512", encryption_key, hmac_salt, 2, 32)
+    return encryption_key, hmac_key
+
+
+def decrypt_sqlcipher_database(
+    source: Path,
+    output: Path,
+    key_hex: str,
+    hmac_key_hex: str | None = None,
+    page_size: int = 4096,
+) -> dict:
+    try:
+        from Crypto.Cipher import AES
+    except ImportError as exc:
+        raise RuntimeError("PyCryptodome is missing. Install requirements.txt.") from exc
+    raw = source.read_bytes()
+    if len(raw) < page_size or len(raw) % page_size:
+        raise ValueError("Encrypted database size is not a whole number of pages")
+    salt = raw[:16]
+    encryption_key, hmac_key = _page_keys(key_hex, salt, hmac_key_hex)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    pages = len(raw) // page_size
+    with os.fdopen(fd, "wb") as handle:
+        for page_number in range(1, pages + 1):
+            page = raw[(page_number - 1) * page_size:page_number * page_size]
+            offset = 16 if page_number == 1 else 0
+            cipher_text = page[offset:page_size - 80]
+            iv = page[page_size - 80:page_size - 64]
+            stored_hmac = page[page_size - 64:page_size]
+            page_bytes = page_number.to_bytes(4, "little")
+            calculated = hmac.new(hmac_key, cipher_text + iv + page_bytes, hashlib.sha512).digest()
+            if not hmac.compare_digest(stored_hmac, calculated):
+                raise ValueError(f"HMAC verification failed on page {page_number}; key or format is wrong")
+            plain = AES.new(encryption_key, AES.MODE_CBC, iv).decrypt(cipher_text)
+            if page_number == 1:
+                handle.write(b"SQLite format 3\x00")
+            handle.write(plain)
+            handle.write(b"\x00" * 80)
+    os.chmod(output, 0o600)
+    return {"status": "ok", "pages": pages, "output": str(output), "key_fingerprint": fingerprint(key_hex)}
+
+
+def _text_columns(connection: sqlite3.Connection, table: str) -> list[str]:
+    safe_table = table.replace('"', '""')
+    rows = connection.execute(f'PRAGMA table_info("{safe_table}")').fetchall()
+    return [row[1] for row in rows if not row[2] or any(token in row[2].upper() for token in ("TEXT", "CHAR", "CLOB"))]
+
+
+def search_database(database: Path, query: str, limit: int = 20) -> list[dict]:
+    if not query:
+        raise ValueError("query must not be empty")
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        tables = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+        results: list[dict] = []
+        for table in tables:
+            safe_table = table.replace('"', '""')
+            for column in _text_columns(connection, table):
+                safe_column = column.replace('"', '""')
+                sql = f'SELECT rowid, "{safe_column}" FROM "{safe_table}" WHERE "{safe_column}" LIKE ? LIMIT ?'
+                for rowid, value in connection.execute(sql, (f"%{query}%", limit - len(results))):
+                    results.append({"table": table, "rowid": rowid, "column": column, "value": value})
+                    if len(results) >= limit:
+                        return results
+        return results
+    finally:
+        connection.close()
+
+
+def browse_tables(database: Path, name_hints: list[str], limit: int = 20) -> list[dict]:
+    """Return rows from tables whose names match a public feature hint."""
+    lowered = [hint.lower() for hint in name_hints]
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        names = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+        matches = [name for name in names if any(hint in name.lower() for hint in lowered)]
+        results: list[dict] = []
+        for table in matches:
+            safe = table.replace('"', '""')
+            for row in connection.execute(f'SELECT * FROM "{safe}" LIMIT ?', (limit - len(results),)):
+                values = {}
+                for key in row.keys():
+                    value = row[key]
+                    values[key] = f"<blob:{len(value)}>" if isinstance(value, bytes) else value
+                results.append({"table": table, "values": values})
+                if len(results) >= limit:
+                    return results
+        return results
+    finally:
+        connection.close()
+
+
+def database_digest(database: Path) -> dict:
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        tables = []
+        for (name,) in rows:
+            safe = name.replace('"', '""')
+            count = connection.execute(f'SELECT COUNT(*) FROM "{safe}"').fetchone()[0]
+            tables.append({"table": name, "rows": count})
+        return {"database": str(database), "table_count": len(tables), "tables": tables}
+    finally:
+        connection.close()
+
+
+def export_results(results: list[dict], output: Path, fmt: str) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        if fmt == "jsonl":
+            for row in results:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        else:
+            writer = csv.DictWriter(handle, fieldnames=["table", "rowid", "column", "value"])
+            writer.writeheader()
+            writer.writerows(results)
+    os.chmod(output, 0o600)
+
+
+def doctor() -> dict:
+    checks = {
+        "macos": platform.system() == "Darwin",
+        "wechat_app": ORIGINAL_APP.is_dir(),
+        "codesign": shutil.which("codesign") is not None,
+        "python_3_10_plus": sys.version_info >= (3, 10),
+        "frida": False,
+        "pycryptodome": False,
+        "zstandard": False,
+    }
+    for module, key in (("frida", "frida"), ("Crypto", "pycryptodome"), ("zstandard", "zstandard")):
+        try:
+            __import__(module)
+            checks[key] = True
+        except ImportError:
+            pass
+    return {"ok": all(checks.values()), "checks": checks, "app_root": str(APP_ROOT)}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("doctor")
+
+    capture = sub.add_parser("capture-keys")
+    capture.add_argument("--authorized", action="store_true")
+    capture.add_argument("--dry-run", action="store_true")
+    capture.add_argument("--launch-copy", action="store_true")
+    capture.add_argument("--duration", type=int, default=30)
+
+    decrypt = sub.add_parser("decrypt")
+    decrypt.add_argument("--authorized", action="store_true")
+    decrypt.add_argument("--source-db", required=True, type=Path)
+    decrypt.add_argument("--output", required=True, type=Path)
+    decrypt.add_argument("--key-hex", required=True)
+    decrypt.add_argument("--hmac-key-hex")
+
+    search = sub.add_parser("search")
+    search.add_argument("query")
+    search.add_argument("--db", required=True, type=Path)
+    search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--show-content", action="store_true")
+
+    export = sub.add_parser("export")
+    export.add_argument("--db", required=True, type=Path)
+    export.add_argument("--query", required=True)
+    export.add_argument("--output", required=True, type=Path)
+    export.add_argument("--format", choices=("jsonl", "csv"), default="jsonl")
+    export.add_argument("--limit", type=int, default=1000)
+
+    for name in ("contacts", "moments", "favorites"):
+        command = sub.add_parser(name)
+        command.add_argument("--db", required=True, type=Path)
+        command.add_argument("--limit", type=int, default=20)
+        command.add_argument("--show-content", action="store_true")
+
+    digest = sub.add_parser("digest")
+    digest.add_argument("--db", required=True, type=Path)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "doctor":
+            report = doctor()
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report["ok"] else 1
+        if args.command == "capture-keys":
+            require_authorized(args.authorized)
+            capture_keys(dry_run=args.dry_run, launch_copy=args.launch_copy, duration=args.duration)
+            return 0
+        if args.command == "decrypt":
+            require_authorized(args.authorized)
+            report = decrypt_sqlcipher_database(args.source_db, args.output, args.key_hex, args.hmac_key_hex)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "digest":
+            print(json.dumps(database_digest(args.db), ensure_ascii=False, indent=2))
+            return 0
+        if args.command in {"contacts", "moments", "favorites"}:
+            hints = {
+                "contacts": ["contact", "friend", "user"],
+                "moments": ["sns", "moment", "timeline"],
+                "favorites": ["favorite", "fav", "collection"],
+            }[args.command]
+            results = browse_tables(args.db, hints, args.limit)
+        else:
+            results = search_database(args.db, args.query, args.limit)
+        if args.command == "export":
+            export_results(results, args.output, args.format)
+            print(json.dumps({"status": "ok", "rows": len(results), "output": str(args.output)}, ensure_ascii=False))
+            return 0
+        if args.show_content:
+            output = results
+        elif args.command in {"contacts", "moments", "favorites"}:
+            output = [{"table": row["table"], "values": {
+                key: f"<redacted:{fingerprint(str(value))}>" for key, value in row["values"].items()
+            }} for row in results]
+        else:
+            output = [{**row, "value": f"<redacted:{fingerprint(str(row['value']))}>"} for row in results]
+        print(json.dumps({"status": "ok", "matches": output}, ensure_ascii=False, indent=2))
+        return 0
+    except (AuthorizationError, FileNotFoundError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

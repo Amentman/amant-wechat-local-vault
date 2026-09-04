@@ -1,0 +1,14 @@
+.DS_Store
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+private/
+exports/
+vault/
+decrypted/
+keys.json
+skills-lock.json

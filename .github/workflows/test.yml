@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate skill metadata
+        run: python3 tests/validate_repository.py
+      - name: Test local vault with synthetic data
+        working-directory: skills/amant-wechat-local-vault
+        run: python3 -m unittest discover -s tests -v
+      - name: Verify capture dry-run
+        working-directory: skills/amant-wechat-local-vault
+        run: python3 scripts/wechat_vault.py capture-keys --authorized --dry-run

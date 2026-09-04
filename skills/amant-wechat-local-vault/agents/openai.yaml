@@ -1,0 +1,6 @@
+interface:
+  display_name: "寂辉微信本地资料库"
+  short_description: "在授权的Mac本机抓取密钥、解密并检索微信资料"
+  default_prompt: "使用 $amant-wechat-local-vault 先检查环境，并说明如何安全建立我的微信本地资料库。"
+policy:
+  allow_implicit_invocation: false
