@@ -1,5 +1,9 @@
 # 寂辉微信本地资料库
 
+> **获取 Skill：** [安装页面](https://skills.sh/Amentman/amant-wechat-local-vault) · [直接下载 ZIP](https://github.com/Amentman/amant-wechat-local-vault/releases/latest/download/amant-wechat-local-vault.zip) · [完整安装说明](#安装)
+>
+> 一行安装：`npx skills add Amentman/amant-wechat-local-vault@amant-wechat-local-vault -g -y`
+
 这是一个可直接安装的 macOS Codex Skill：在当前用户明确授权后，检查微信 4.x 本地环境、自动捕获数据库派生密钥候选、解密用户指定的数据库副本，再进行结构摘要、关键词搜索、联系人/朋友圈/收藏候选表浏览和 JSONL/CSV 导出。数据默认只留在本机。
 
 > 仅用于处理你本人或你已经获得明确授权的微信数据。它不是远程入侵、账号接管、消息发送或云端采集工具。

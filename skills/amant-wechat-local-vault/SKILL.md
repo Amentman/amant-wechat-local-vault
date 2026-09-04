@@ -5,7 +5,7 @@ description: Use when a macOS user wants to inspect, decrypt, search, export, or
 
 # 寂辉微信本地资料库
 
-当前公开版本：v0.3.2。
+当前公开版本：v0.3.3。
 
 只处理当前用户本人或已获明确授权的本机微信数据。默认本地运行，不上传、不发消息、不操作微信聊天界面。
 

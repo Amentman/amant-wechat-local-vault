@@ -17,6 +17,13 @@ def assert_relative_markdown_links_exist(markdown_path: Path) -> None:
         assert (markdown_path.parent / target).exists(), f"broken link: {markdown_path}:{target}"
 
 
+def assert_top_install_entry(readme: str, skill_name: str) -> None:
+    top = "\n".join(readme.splitlines()[:20])
+    assert f"https://skills.sh/Amentman/{skill_name}" in top
+    assert f"https://github.com/Amentman/{skill_name}/releases/latest/download/{skill_name}.zip" in top
+    assert f"npx skills add Amentman/{skill_name}@{skill_name} -g -y" in top
+
+
 def assert_workflow_docs_complete(readme: str, skill_text: str) -> None:
     required_readme_sections = [
         "## 这个 Skill 解决什么问题",
@@ -48,7 +55,7 @@ def assert_workflow_docs_complete(readme: str, skill_text: str) -> None:
 
 def main() -> None:
     manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-    assert manifest["version"] == "0.3.2"
+    assert manifest["version"] == "0.3.3"
     assert manifest["author"]["name"] == "Amant"
     assert manifest["skills"] == "./skills/"
 
@@ -62,6 +69,7 @@ def main() -> None:
     assert description and description.group(1).strip()
 
     readme = (ROOT / "README.md").read_text()
+    assert_top_install_entry(readme, manifest["name"])
     assert f"Amentman/{manifest['name']}" in readme
     assert "npx skills add" in readme
     assert_workflow_docs_complete(readme, skill_text)
