@@ -55,7 +55,7 @@ def write_private_json(path: Path, payload: object) -> None:
     os.chmod(path, 0o600)
 
 
-def load_captured_key(path: Path, key_fingerprint: str | None = None) -> str:
+def read_candidate_store(path: Path) -> list[dict]:
     if path.is_symlink():
         raise PermissionError("Refusing to read a symbolic-link key store")
     metadata = path.stat()
@@ -67,6 +67,11 @@ def load_captured_key(path: Path, key_fingerprint: str | None = None) -> str:
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
     if not isinstance(candidates, list):
         raise ValueError("Key store must contain a candidates list")
+    return candidates
+
+
+def load_captured_key(path: Path, key_fingerprint: str | None = None) -> str:
+    candidates = read_candidate_store(path)
     keys = [
         item["derived_key"]
         for item in candidates
@@ -81,6 +86,49 @@ def load_captured_key(path: Path, key_fingerprint: str | None = None) -> str:
     if len(keys) != 1:
         raise ValueError("Key store has multiple valid candidates; select one with --key-fingerprint")
     return keys[0]
+
+
+def persist_captured_candidates(path: Path, captured: list[dict]) -> dict:
+    existing = read_candidate_store(path) if path.exists() or path.is_symlink() else []
+    if not captured:
+        return {
+            "status": "no-candidates",
+            "candidate_count": 0,
+            "added_candidate_count": 0,
+            "total_candidate_count": len(existing),
+            "key_store": str(path),
+        }
+
+    merged: list[dict] = []
+    seen: set[tuple[object, object]] = set()
+    for candidate in existing:
+        if not isinstance(candidate, dict):
+            raise ValueError("Every key-store candidate must be an object")
+        pair = (candidate.get("derived_key"), candidate.get("salt"))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        merged.append(candidate)
+
+    added_candidate_count = 0
+    for candidate in captured:
+        if not isinstance(candidate, dict):
+            raise ValueError("Every captured candidate must be an object")
+        pair = (candidate.get("derived_key"), candidate.get("salt"))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        merged.append(candidate)
+        added_candidate_count += 1
+
+    write_private_json(path, {"candidates": merged})
+    return {
+        "status": "ok",
+        "candidate_count": len(captured),
+        "added_candidate_count": added_candidate_count,
+        "total_candidate_count": len(merged),
+        "key_store": str(path),
+    }
 
 
 def build_frida_script() -> str:
@@ -233,8 +281,8 @@ def capture_keys(*, dry_run: bool, launch_copy: bool, duration: int) -> list[dic
     finally:
         script.unload()
         session.detach()
-    write_private_json(KEY_STORE, {"candidates": captured})
-    print(json.dumps({"status": "ok", "candidate_count": len(captured), "key_store": str(KEY_STORE)}, ensure_ascii=False))
+    report = persist_captured_candidates(KEY_STORE, captured)
+    print(json.dumps(report, ensure_ascii=False))
     return captured
 
 
@@ -483,8 +531,8 @@ def main() -> int:
             return 0 if report["ok"] else 1
         require_authorized(args.authorized)
         if args.command == "capture-keys":
-            capture_keys(dry_run=args.dry_run, launch_copy=args.launch_copy, duration=args.duration)
-            return 0
+            captured = capture_keys(dry_run=args.dry_run, launch_copy=args.launch_copy, duration=args.duration)
+            return 0 if args.dry_run or captured else 3
         if args.command == "decrypt":
             key_hex = load_captured_key(args.key_file, args.key_fingerprint)
             report = decrypt_sqlcipher_database(args.source_db, args.output, key_hex, overwrite=args.overwrite)

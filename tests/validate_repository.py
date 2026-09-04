@@ -42,11 +42,13 @@ def assert_workflow_docs_complete(readme: str, skill_text: str) -> None:
     assert "--key-hex" not in skill_text
     assert "--key-fingerprint" in readme
     assert "原子" in readme
+    assert "status: no-candidates" in readme
+    assert "total_candidate_count" in readme
 
 
 def main() -> None:
     manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-    assert manifest["version"] == "0.3.1"
+    assert manifest["version"] == "0.3.2"
     assert manifest["author"]["name"] == "Amant"
     assert manifest["skills"] == "./skills/"
 

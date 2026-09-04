@@ -35,7 +35,7 @@ flowchart TD
     G -- 是 --> I[capture-keys dry-run 展示计划]
     I --> J{附加当前微信还是启动工具副本?}
     J --> K[限定时间监听密钥派生函数]
-    K --> L[候选密钥写入仅本人可读文件 终端只显示指纹]
+    K --> L[与旧候选去重合并到仅本人可读文件 终端只显示指纹]
     L --> M[用户指定加密 DB 与新的明文输出路径]
     M --> N[逐页 HMAC 验证并解密到副本]
     N --> O{解密是否完整通过?}
@@ -120,7 +120,7 @@ python3 scripts/bootstrap.py --install
 | 2. 设备体检 | 无私有数据 | 检查 macOS、WeChat、codesign、Frida 和加密库 | `doctor` JSON |
 | 3. 授权门 | 数据归属和本次允许的动作 | 没有明确授权就停止；私有命令要求 `--authorized` | 授权范围说明 |
 | 4. 捕获预演 | attach 或工具副本；持续时间 | 输出将使用的 App、模式、保存位置和时长，不附加进程 | dry-run 计划 JSON |
-| 5. 捕获候选 | 用户明确允许真实捕获 | 监听本机 PBKDF 派生结果，去重候选；终端只打印指纹 | 私有 `keys.json`、candidate count |
+| 5. 捕获候选 | 用户明确允许真实捕获 | 监听本机 PBKDF 派生结果，与旧候选去重合并；零候选时保留旧 key store；终端只打印指纹 | 私有 `keys.json`、本次新增数和总候选数 |
 | 6. 选择数据库 | 加密 DB 绝对路径、新输出路径和候选指纹 | 从 owner-only key store 读取候选，逐页验证并原子写入新副本 | 权限为 `0600` 的明文副本 |
 | 7. 查看结构 | 明文 DB 路径 | 只读打开 SQLite，列出真实表名和行数 | digest JSON |
 | 8. 搜索或浏览 | 关键词、功能、条数 | 搜索文本列，或按公开功能提示找候选表 | 默认脱敏的匹配结果 |
@@ -185,7 +185,7 @@ python3 scripts/bootstrap.py --install
   --query "产品反馈" --format jsonl --output ./exports/result.jsonl
 ```
 
-捕获阶段可能得到多个候选，也可能因为 30 秒内没有发生对应派生而得到 `candidate_count: 0`。候选是否属于目标数据库，以解密过程的逐页 HMAC 验证为准；不能凭候选出现就宣称成功。
+捕获阶段可能得到多个候选，也可能因为 30 秒内没有发生对应派生而得到 `status: no-candidates`、`candidate_count: 0` 和退出码 3。零候选不会新建、清空或改写已有 `keys.json`；捕获到的新候选会与旧候选按 key/salt 去重合并，并同时报告 `added_candidate_count` 和 `total_candidate_count`。候选是否属于目标数据库，以解密过程的逐页 HMAC 验证为准；不能凭候选出现就宣称成功。
 
 `contacts`、`moments` 和 `favorites` 命令会根据表名公开提示寻找候选表：
 
@@ -203,7 +203,7 @@ python3 scripts/bootstrap.py --install
 - 用户没有明确说明数据归属和本次授权：不加 `--authorized`，不读取私有数据。
 - dry-run 尚未让用户确认真实捕获模式：不附加进程、不复制 App。
 - attach 找不到微信进程：报告失败；不能自行改为 `--launch-copy`。
-- `candidate_count: 0`：只说明本次没有捕获到候选，不等于没有数据库或工具已完成。
+- `status: no-candidates`、`candidate_count: 0`：只说明本次没有捕获到候选；保留旧 key store，不等于没有数据库或工具已完成。
 - HMAC 任一页失败：停止，说明 key 或数据库格式不匹配，不把部分输出当作有效数据库。
 - 源和输出是同一路径、符号链接或硬链接：拒绝执行。输出已存在时默认停止；只有用户明确要求替换才使用 `--overwrite`，且失败时保留旧文件。
 - 完整密钥只从权限为 `0600`、属于当前用户且不是符号链接的 `keys.json` 读取；命令行只传候选指纹。
@@ -217,7 +217,7 @@ python3 scripts/bootstrap.py --install
 只有以下证据齐全，才能说对应阶段完成：
 
 - 运行环境：bootstrap 返回 `ready`，doctor 的每项检查结果明确。
-- 密钥捕获：用户确认了真实模式；输出有真实 `candidate_count` 和本机 key store 路径，完整秘密未出现在终端。
+- 密钥捕获：用户确认了真实模式；只有 `status: ok` 且 `candidate_count` 大于 0 才算本次捕获到候选；输出包含新增数、总候选数和本机 key store 路径，完整秘密未出现在终端。
 - 数据库解密：目标 key 对全部页面的 HMAC 检查通过；输出经临时文件原子写成另一个实际存在的 `0600` 文件；源数据库未被修改，失败时没有残留部分明文。
 - 检索：先确认 SQLite 能以只读模式打开，digest 给出真实表数和行数；搜索报告真实匹配数。
 - 导出：目标 JSONL/CSV 实际存在、权限为 `0600`，报告的行数与文件内容一致。

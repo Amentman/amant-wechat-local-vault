@@ -1,22 +1,29 @@
 import importlib.util
+import io
 import json
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.wechat_vault import (
     AuthorizationError,
     browse_tables,
     build_frida_script,
+    capture_keys,
     decrypt_sqlcipher_database,
     export_results,
     fingerprint,
     load_captured_key,
+    main,
     parse_args,
     parse_capture_message,
+    persist_captured_candidates,
     require_authorized,
     search_database,
     write_private_json,
@@ -134,6 +141,112 @@ class WeChatVaultTests(unittest.TestCase):
             target.chmod(0o644)
             with self.assertRaises(PermissionError):
                 load_captured_key(target)
+
+    def test_zero_candidate_capture_preserves_existing_key_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "keys.json"
+            existing = {
+                "candidates": [{
+                    "derived_key": "ab" * 32,
+                    "salt": "cd" * 16,
+                    "rounds": 256000,
+                    "captured_at": 1700000000,
+                }]
+            }
+            write_private_json(target, existing)
+            original = target.read_bytes()
+
+            report = persist_captured_candidates(target, [])
+
+            self.assertEqual("no-candidates", report["status"])
+            self.assertEqual(0, report["candidate_count"])
+            self.assertEqual(1, report["total_candidate_count"])
+            self.assertEqual(original, target.read_bytes())
+
+    def test_zero_candidate_frida_session_reports_no_candidates_and_preserves_store(self):
+        class FakeScript:
+            def on(self, _event, _callback):
+                pass
+
+            def load(self):
+                pass
+
+            def unload(self):
+                pass
+
+        class FakeSession:
+            def create_script(self, _source):
+                return FakeScript()
+
+            def detach(self):
+                pass
+
+        class FakeDevice:
+            def attach(self, process):
+                self.attached_process = process
+                return FakeSession()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "keys.json"
+            existing = {"candidates": [{
+                "derived_key": "ab" * 32,
+                "salt": "cd" * 16,
+                "rounds": 256000,
+                "captured_at": 1700000000,
+            }]}
+            write_private_json(target, existing)
+            original = target.read_bytes()
+            fake_frida = types.SimpleNamespace(get_local_device=lambda: FakeDevice())
+            output = io.StringIO()
+
+            with patch.dict(sys.modules, {"frida": fake_frida}), \
+                    patch("scripts.wechat_vault.KEY_STORE", target), \
+                    redirect_stdout(output):
+                captured = capture_keys(dry_run=False, launch_copy=False, duration=0)
+
+            report = json.loads(output.getvalue().strip().splitlines()[-1])
+            self.assertEqual([], captured)
+            self.assertEqual("no-candidates", report["status"])
+            self.assertEqual(1, report["total_candidate_count"])
+            self.assertEqual(original, target.read_bytes())
+
+    def test_main_returns_three_when_real_capture_has_no_candidates(self):
+        args = types.SimpleNamespace(
+            command="capture-keys",
+            authorized=True,
+            dry_run=False,
+            launch_copy=False,
+            duration=0,
+        )
+        with patch("scripts.wechat_vault.parse_args", return_value=args), \
+                patch("scripts.wechat_vault.capture_keys", return_value=[]):
+            self.assertEqual(3, main())
+
+    def test_new_capture_merges_with_existing_candidates_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "keys.json"
+            first = {
+                "derived_key": "ab" * 32,
+                "salt": "cd" * 16,
+                "rounds": 256000,
+                "captured_at": 1700000000,
+            }
+            second = {
+                "derived_key": "ef" * 32,
+                "salt": "12" * 16,
+                "rounds": 256000,
+                "captured_at": 1700000100,
+            }
+            write_private_json(target, {"candidates": [first]})
+
+            report = persist_captured_candidates(target, [dict(first), second])
+
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual("ok", report["status"])
+            self.assertEqual(2, report["candidate_count"])
+            self.assertEqual(1, report["added_candidate_count"])
+            self.assertEqual(2, report["total_candidate_count"])
+            self.assertEqual([first, second], payload["candidates"])
 
     def test_search_database_finds_text_without_schema_assumptions(self):
         with tempfile.TemporaryDirectory() as tmp:
